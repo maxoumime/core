@@ -88,6 +88,57 @@ def _get_local_devices_for_gateway(
     return local_device_urls
 
 
+def _remove_local_devices_from_cloud(
+    hass: HomeAssistant,
+    entry: OverkizDataConfigEntry,
+    coordinator: OverkizDataUpdateCoordinator,
+) -> None:
+    """Remove devices from cloud entry that are managed by a local entry.
+
+    This function checks for devices that exist in both cloud and local entries
+    and removes them from the cloud entry to avoid duplicates.
+    """
+    if not entry.unique_id:
+        return
+
+    local_device_urls = _get_local_devices_for_gateway(
+        hass, entry.unique_id, entry.entry_id
+    )
+
+    if not local_device_urls:
+        return
+
+    # Find devices to remove (present in both cloud coordinator and local entry)
+    devices_to_remove = local_device_urls & set(coordinator.devices.keys())
+
+    if not devices_to_remove:
+        return
+
+    # Remove devices managed by local entry from the coordinator
+    for device_url in devices_to_remove:
+        coordinator.devices.pop(device_url, None)
+
+    LOGGER.debug(
+        "Removed %d devices from cloud entry that are managed by local entry: %s",
+        len(devices_to_remove),
+        devices_to_remove,
+    )
+
+    # Also remove these devices from the device registry if they exist
+    device_registry = dr.async_get(hass)
+    for device_url in devices_to_remove:
+        base_device_url = device_url.split("#")[0]
+        if device_entry := device_registry.async_get_device(
+            identifiers={(DOMAIN, base_device_url)}
+        ):
+            # Only remove if this device is linked to the cloud entry
+            if entry.entry_id in device_entry.config_entries:
+                device_registry.async_update_device(
+                    device_entry.id,
+                    remove_config_entry_id=entry.entry_id,
+                )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: OverkizDataConfigEntry) -> bool:
     """Set up Overkiz from a config entry."""
     client: OverkizClient | None = None
@@ -148,35 +199,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: OverkizDataConfigEntry) 
     await coordinator.async_config_entry_first_refresh()
 
     # When cloud entry is loaded and a local entry exists for the same gateway,
-    # remove devices that are already managed by the local entry to avoid duplicates
-    if api_type == APIType.CLOUD and entry.unique_id:
-        local_device_urls = _get_local_devices_for_gateway(
-            hass, entry.unique_id, entry.entry_id
-        )
-        if local_device_urls:
-            # Remove devices managed by local entry from the coordinator
-            for device_url in local_device_urls:
-                coordinator.devices.pop(device_url, None)
+    # remove devices that are already managed by the local entry to avoid duplicates.
+    # Also set up a listener to continuously check for new local devices.
+    if api_type == APIType.CLOUD:
+        # Initial removal of local devices
+        _remove_local_devices_from_cloud(hass, entry, coordinator)
 
-            LOGGER.debug(
-                "Removed %d devices from cloud entry that are managed by local entry: %s",
-                len(local_device_urls),
-                local_device_urls,
-            )
+        # Set up a listener to check for new local devices after each coordinator update
+        # This handles the case where new devices are added to local while running
+        @callback
+        def _async_check_local_devices() -> None:
+            """Check for and remove devices that are now managed by local entry."""
+            _remove_local_devices_from_cloud(hass, entry, coordinator)
 
-            # Also remove these devices from the device registry if they exist
-            device_registry = dr.async_get(hass)
-            for device_url in local_device_urls:
-                base_device_url = device_url.split("#")[0]
-                if device_entry := device_registry.async_get_device(
-                    identifiers={(DOMAIN, base_device_url)}
-                ):
-                    # Only remove if this device is linked to the cloud entry
-                    if entry.entry_id in device_entry.config_entries:
-                        device_registry.async_update_device(
-                            device_entry.id,
-                            remove_config_entry_id=entry.entry_id,
-                        )
+        entry.async_on_unload(coordinator.async_add_listener(_async_check_local_devices))
 
     if coordinator.is_stateless:
         LOGGER.debug(

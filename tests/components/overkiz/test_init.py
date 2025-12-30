@@ -329,3 +329,97 @@ async def test_local_entry_not_affected_by_cloud(hass: HomeAssistant) -> None:
     # Cloud entry still has the device (it was set up first)
     # Users may want to reload cloud after adding local to trigger self-reparation
     assert shared_device_url in cloud_entry.runtime_data.coordinator.devices
+
+
+async def test_cloud_removes_device_added_dynamically_to_local(
+    hass: HomeAssistant,
+) -> None:
+    """Test that cloud entry removes a device when it's dynamically added to local."""
+    # Start with a device only in cloud
+    shared_device_url = f"io://{TEST_GATEWAY_ID}/12345"
+    cloud_only_device_url = f"io://{TEST_GATEWAY_ID}/67890"
+
+    shared_device = _create_mock_device(
+        shared_device_url, "Shared Cover", UIClass.ROLLER_SHUTTER
+    )
+    cloud_device = _create_mock_device(
+        cloud_only_device_url, "Climate Device", UIClass.HEATING_SYSTEM
+    )
+
+    # First, set up the local entry with NO devices initially
+    local_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_GATEWAY_ID,
+        data={
+            "host": TEST_HOST,
+            "token": TEST_TOKEN,
+            "verify_ssl": True,
+            "hub": TEST_SERVER,
+            "api_type": "local",
+        },
+    )
+    local_entry.add_to_hass(hass)
+
+    local_setup = _create_mock_setup(TEST_GATEWAY_ID, [])  # No devices initially
+
+    with patch.multiple(
+        "pyoverkiz.client.OverkizClient",
+        login=AsyncMock(return_value=True),
+        get_setup=AsyncMock(return_value=local_setup),
+        get_scenarios=AsyncMock(return_value=[]),
+        fetch_events=AsyncMock(return_value=[]),
+    ):
+        await hass.config_entries.async_setup(local_entry.entry_id)
+        await hass.async_block_till_done()
+
+    # Verify local entry is loaded with no devices
+    assert local_entry.runtime_data is not None
+    assert len(local_entry.runtime_data.coordinator.devices) == 0
+
+    # Now set up the cloud entry with both devices
+    cloud_entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=TEST_GATEWAY_ID,
+        data={
+            "username": TEST_EMAIL,
+            "password": TEST_PASSWORD,
+            "hub": TEST_SERVER,
+            "api_type": "cloud",
+        },
+    )
+    cloud_entry.add_to_hass(hass)
+
+    cloud_setup = _create_mock_setup(TEST_GATEWAY_ID, [shared_device, cloud_device])
+
+    with patch.multiple(
+        "pyoverkiz.client.OverkizClient",
+        login=AsyncMock(return_value=True),
+        get_setup=AsyncMock(return_value=cloud_setup),
+        get_scenarios=AsyncMock(return_value=[]),
+        fetch_events=AsyncMock(return_value=[]),
+    ):
+        await hass.config_entries.async_setup(cloud_entry.entry_id)
+        await hass.async_block_till_done()
+
+    # Cloud entry should have both devices since local has none
+    assert cloud_entry.runtime_data is not None
+    assert shared_device_url in cloud_entry.runtime_data.coordinator.devices
+    assert cloud_only_device_url in cloud_entry.runtime_data.coordinator.devices
+
+    # Simulate a new device being added to local entry dynamically
+    # (this happens when a user connects a new device to their gateway)
+    local_entry.runtime_data.coordinator.devices[shared_device_url] = shared_device
+
+    # Trigger a coordinator update on cloud entry
+    # This should detect the new local device and remove it from cloud
+    with patch.multiple(
+        "pyoverkiz.client.OverkizClient",
+        fetch_events=AsyncMock(return_value=[]),
+    ):
+        await cloud_entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    # Now cloud should no longer have the shared device
+    assert shared_device_url not in cloud_entry.runtime_data.coordinator.devices
+    # But should still have the cloud-only device
+    assert cloud_only_device_url in cloud_entry.runtime_data.coordinator.devices
