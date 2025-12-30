@@ -19,7 +19,7 @@ from pyoverkiz.exceptions import (
 from pyoverkiz.models import Device, OverkizServer, Scenario
 from pyoverkiz.utils import generate_local_server
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -56,6 +56,52 @@ class HomeAssistantOverkizData:
 
 
 type OverkizDataConfigEntry = ConfigEntry[HomeAssistantOverkizData]
+
+
+def _get_gateway_id_from_unique_id(unique_id: str | None) -> str | None:
+    """Extract gateway ID from unique ID (format: gateway_id-api_type)."""
+    if unique_id is None:
+        return None
+    # Handle both old format (just gateway_id) and new format (gateway_id-api_type)
+    if "-" in unique_id and unique_id.rsplit("-", 1)[-1] in ("local", "cloud"):
+        return unique_id.rsplit("-", 1)[0]
+    return unique_id
+
+
+def _find_hybrid_local_entry(
+    hass: HomeAssistant, cloud_entry: OverkizDataConfigEntry
+) -> OverkizDataConfigEntry | None:
+    """Find a matching local API entry for a cloud API entry.
+
+    When a cloud entry is configured, check if there's a corresponding local entry
+    for the same gateway. This enables hybrid mode where local devices take priority.
+    """
+    gateway_id = _get_gateway_id_from_unique_id(cloud_entry.unique_id)
+    if gateway_id is None:
+        return None
+
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.entry_id == cloud_entry.entry_id:
+            continue
+        entry_gateway_id = _get_gateway_id_from_unique_id(entry.unique_id)
+        if entry_gateway_id == gateway_id:
+            entry_api_type = entry.data.get(CONF_API_TYPE)
+            if entry_api_type == APIType.LOCAL:
+                return entry  # type: ignore[return-value]
+    return None
+
+
+def _hybrid_filter_local_devices(
+    local_entry: OverkizDataConfigEntry, devices: list[Device]
+) -> list[Device]:
+    """Filter out devices that are already managed by the local API entry.
+
+    In hybrid mode, when both local and cloud entries exist for the same gateway,
+    the local entry takes priority. This function removes devices from the cloud
+    entry that are already being handled by the local entry.
+    """
+    local_device_urls = set(local_entry.runtime_data.coordinator.devices.keys())
+    return [d for d in devices if d.device_url not in local_device_urls]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: OverkizDataConfigEntry) -> bool:
@@ -106,12 +152,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: OverkizDataConfigEntry) 
     except MaintenanceException as exception:
         raise ConfigEntryNotReady("Server is down for maintenance") from exception
 
+    # Hybrid mode: When both local and cloud entries exist for the same gateway,
+    # filter out devices from the cloud entry that are already managed by local.
+    # This prevents duplicate entities and ensures local API takes priority.
+    devices = setup.devices
+    if api_type == APIType.CLOUD:
+        if local_entry := _find_hybrid_local_entry(hass, entry):
+            # Wait for local entry to be fully loaded before filtering
+            if local_entry.state in (
+                ConfigEntryState.NOT_LOADED,
+                ConfigEntryState.SETUP_IN_PROGRESS,
+            ):
+                raise ConfigEntryNotReady(
+                    "Waiting for local API entry to load first"
+                )
+            devices = _hybrid_filter_local_devices(local_entry, devices)
+            LOGGER.debug(
+                "Hybrid mode: Filtered %d devices already managed by local API",
+                len(setup.devices) - len(devices),
+            )
+
     coordinator = OverkizDataUpdateCoordinator(
         hass,
         entry,
         LOGGER,
         client=client,
-        devices=setup.devices,
+        devices=devices,
         places=setup.root_place,
     )
 
@@ -177,6 +243,37 @@ async def async_unload_entry(
 ) -> bool:
     """Unload a config entry."""
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: OverkizDataConfigEntry
+) -> bool:
+    """Migrate old entry to new format.
+
+    Version 2: Unique ID format changed from gateway_id to gateway_id-api_type
+    to support hybrid mode (both local and cloud entries for same gateway).
+    """
+    if config_entry.version == 1:
+        # Get the API type from the entry data
+        api_type = config_entry.data.get(CONF_API_TYPE, APIType.CLOUD)
+
+        # Update unique ID to include API type
+        new_unique_id = f"{config_entry.unique_id}-{api_type}"
+
+        LOGGER.debug(
+            "Migrating config entry from version 1 to 2: unique_id %s -> %s",
+            config_entry.unique_id,
+            new_unique_id,
+        )
+
+        hass.config_entries.async_update_entry(
+            config_entry,
+            unique_id=new_unique_id,
+            version=2,
+            minor_version=1,
+        )
+
+    return True
 
 
 async def _async_migrate_entries(

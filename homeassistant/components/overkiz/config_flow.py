@@ -41,7 +41,8 @@ from .const import CONF_API_TYPE, CONF_HUB, DEFAULT_SERVER, DOMAIN, LOGGER
 class OverkizConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Overkiz (by Somfy)."""
 
-    VERSION = 1
+    VERSION = 2
+    MINOR_VERSION = 1
 
     _verify_ssl: bool = True
     _api_type: APIType = APIType.CLOUD
@@ -77,11 +78,14 @@ class OverkizConfigFlow(ConfigFlow, domain=DOMAIN):
 
         await client.login(register_event_listener=False)
 
-        # Set main gateway id as unique id
+        # Set main gateway id with API type as unique id
+        # This allows both local and cloud entries for the same gateway
         if gateways := await client.get_gateways():
             for gateway in gateways:
                 if is_overkiz_gateway(gateway.id):
-                    await self.async_set_unique_id(gateway.id, raise_on_progress=False)
+                    await self.async_set_unique_id(
+                        f"{gateway.id}-{self._api_type}", raise_on_progress=False
+                    )
                     break
 
         return user_input
@@ -330,8 +334,15 @@ class OverkizConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _process_discovery(self, gateway_id: str) -> ConfigFlowResult:
         """Handle discovery of a gateway."""
+        # Check if gateway is already configured with either local or cloud API
+        # Discovery should abort if gateway exists with any API type
+        for entry in self._async_current_entries():
+            if entry.unique_id and entry.unique_id.startswith(f"{gateway_id}-"):
+                return self.async_abort(reason="already_configured")
+
+        # Set temporary unique ID for discovery flow
+        # Final unique ID with API type will be set in async_validate_input
         await self.async_set_unique_id(gateway_id)
-        self._abort_if_unique_id_configured()
         self.context["title_placeholders"] = {"gateway_id": gateway_id}
 
         return await self.async_step_user()
