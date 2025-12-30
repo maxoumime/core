@@ -19,7 +19,7 @@ from pyoverkiz.exceptions import (
 from pyoverkiz.models import Device, OverkizServer, Scenario
 from pyoverkiz.utils import generate_local_server
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -56,6 +56,36 @@ class HomeAssistantOverkizData:
 
 
 type OverkizDataConfigEntry = ConfigEntry[HomeAssistantOverkizData]
+
+
+def _get_local_devices_for_gateway(
+    hass: HomeAssistant, gateway_id: str, exclude_entry_id: str
+) -> set[str]:
+    """Get device URLs managed by a local entry for the same gateway.
+
+    When both cloud and local entries exist for the same gateway, this returns
+    the device URLs that are already managed by the local entry so they can be
+    excluded from the cloud entry.
+    """
+    local_device_urls: set[str] = set()
+
+    for config_entry in hass.config_entries.async_entries(DOMAIN):
+        # Skip the current entry being set up
+        if config_entry.entry_id == exclude_entry_id:
+            continue
+
+        # Only consider loaded local entries for the same gateway
+        if (
+            config_entry.state is ConfigEntryState.LOADED
+            and config_entry.data.get(CONF_API_TYPE) == APIType.LOCAL
+            and config_entry.unique_id == gateway_id
+        ):
+            # Get device URLs from the local entry's coordinator
+            runtime_data = config_entry.runtime_data
+            if runtime_data and hasattr(runtime_data, "coordinator"):
+                local_device_urls.update(runtime_data.coordinator.devices.keys())
+
+    return local_device_urls
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: OverkizDataConfigEntry) -> bool:
@@ -116,6 +146,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: OverkizDataConfigEntry) 
     )
 
     await coordinator.async_config_entry_first_refresh()
+
+    # When cloud entry is loaded and a local entry exists for the same gateway,
+    # remove devices that are already managed by the local entry to avoid duplicates
+    if api_type == APIType.CLOUD and entry.unique_id:
+        local_device_urls = _get_local_devices_for_gateway(
+            hass, entry.unique_id, entry.entry_id
+        )
+        if local_device_urls:
+            # Remove devices managed by local entry from the coordinator
+            for device_url in local_device_urls:
+                coordinator.devices.pop(device_url, None)
+
+            LOGGER.debug(
+                "Removed %d devices from cloud entry that are managed by local entry: %s",
+                len(local_device_urls),
+                local_device_urls,
+            )
+
+            # Also remove these devices from the device registry if they exist
+            device_registry = dr.async_get(hass)
+            for device_url in local_device_urls:
+                base_device_url = device_url.split("#")[0]
+                if device_entry := device_registry.async_get_device(
+                    identifiers={(DOMAIN, base_device_url)}
+                ):
+                    # Only remove if this device is linked to the cloud entry
+                    if entry.entry_id in device_entry.config_entries:
+                        device_registry.async_update_device(
+                            device_entry.id,
+                            remove_config_entry_id=entry.entry_id,
+                        )
 
     if coordinator.is_stateless:
         LOGGER.debug(
